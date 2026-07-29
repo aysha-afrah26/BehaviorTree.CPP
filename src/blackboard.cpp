@@ -4,6 +4,7 @@
 
 #include <tuple>
 #include <unordered_set>
+#include <vector>
 
 namespace BT
 {
@@ -14,7 +15,71 @@ bool IsPrivateKey(StringView str)
 {
   return str.size() >= 1 && str.data()[0] == '_';
 }
+
+// Entries removed from a Blackboard while an AnyPtrLocked still held their
+// entry_mutex. An AnyPtrLocked does not own the entry, and the only signal that
+// the holder is done with it is the release of the mutex, so such entries are
+// parked here and destroyed by a later removal that finds them unlocked.
+struct DeferredEntries
+{
+  std::mutex mutex;
+  std::vector<std::shared_ptr<Blackboard::Entry>> entries;
+};
+
+DeferredEntries& GetDeferredEntries()
+{
+  // Never destroyed: a Blackboard with static storage duration may be
+  // destroyed after this object during program exit.
+  static auto* const instance = new DeferredEntries();
+  return *instance;
+}
+
+// Destroy the entries that were removed from a Blackboard, except those whose
+// entry_mutex is still locked by an outstanding AnyPtrLocked: these are parked
+// until a later call finds them unlocked. This never blocks, so removing an
+// entry while holding a lock on it (from any thread) cannot deadlock.
+void ReleaseEntries(std::vector<std::shared_ptr<Blackboard::Entry>> entries)
+{
+  std::vector<std::shared_ptr<Blackboard::Entry>> to_destroy;
+  auto& deferred = GetDeferredEntries();
+  {
+    const std::scoped_lock lock(deferred.mutex);
+    entries.insert(entries.end(), std::make_move_iterator(deferred.entries.begin()),
+                   std::make_move_iterator(deferred.entries.end()));
+    deferred.entries.clear();
+    for(auto& entry : entries)
+    {
+      // A removed entry can't be found by getAnyLocked() anymore, so once
+      // try_lock() succeeds nobody holds it.
+      if(entry->entry_mutex.try_lock())
+      {
+        entry->entry_mutex.unlock();
+        to_destroy.push_back(std::move(entry));
+      }
+      else
+      {
+        deferred.entries.push_back(std::move(entry));
+      }
+    }
+  }
+  // "to_destroy" is released here, outside the lock, because the destructor
+  // of a stored value may call back into a Blackboard.
+}
 }  // namespace
+
+Blackboard::~Blackboard()
+{
+  // An AnyPtrLocked may still refer to one of the entries: let ReleaseEntries()
+  // defer the destruction of that entry until the lock is released.
+  std::vector<std::shared_ptr<Entry>> entries;
+  entries.reserve(storage_.size());
+  for(auto& [key, entry] : storage_)
+  {
+    entries.push_back(std::move(entry));
+  }
+  storage_.clear();
+  ReleaseEntries(std::move(entries));
+}
 
 void Blackboard::enableAutoRemapping(bool remapping)
 {
@@ -23,18 +88,31 @@ void Blackboard::enableAutoRemapping(bool remapping)
 
 AnyPtrLocked Blackboard::getAnyLocked(const std::string& key)
 {
-  if(auto entry = getEntry(key))
+  while(auto entry = getEntry(key))
   {
-    return AnyPtrLocked(&entry->value, &entry->entry_mutex);
+    AnyPtrLocked locked(&entry->value, &entry->entry_mutex);
+    // Re-check under entry_mutex: the removal paths erase the entry from the
+    // storage first and destroy it only once its mutex can be acquired (see
+    // ReleaseEntries). If the key still resolves to this entry, it will stay
+    // alive as long as the lock is held; otherwise release the lock and look
+    // the key up again.
+    if(getEntry(key) == entry)
+    {
+      return locked;
+    }
   }
   return {};
 }
 
 AnyPtrLocked Blackboard::getAnyLocked(const std::string& key) const
 {
-  if(auto entry = getEntry(key))
+  while(auto entry = getEntry(key))
   {
-    return AnyPtrLocked(&entry->value, const_cast<std::mutex*>(&entry->entry_mutex));
+    AnyPtrLocked locked(&entry->value, const_cast<std::mutex*>(&entry->entry_mutex));
+    if(getEntry(key) == entry)
+    {
+      return locked;
+    }
   }
   return {};
 }
@@ -155,10 +233,38 @@ std::vector<StringView> Blackboard::getKeys() const
   return out;
 }
 
+void Blackboard::unset(const std::string& key)
+{
+  std::vector<std::shared_ptr<Entry>> removed;
+  {
+    const std::unique_lock storage_lock(storage_mutex_);
+
+    // check local storage
+    auto it = storage_.find(key);
+    if(it == storage_.end())
+    {
+      // No entry, nothing to do.
+      return;
+    }
+    removed.push_back(std::move(it->second));
+    storage_.erase(it);
+  }
+  ReleaseEntries(std::move(removed));
+}
+
 void Blackboard::clear()
 {
-  const std::unique_lock storage_lock(storage_mutex_);
-  storage_.clear();
+  std::vector<std::shared_ptr<Entry>> removed;
+  {
+    const std::unique_lock storage_lock(storage_mutex_);
+    removed.reserve(storage_.size());
+    for(auto& [key, entry] : storage_)
+    {
+      removed.push_back(std::move(entry));
+    }
+    storage_.clear();
+  }
+  ReleaseEntries(std::move(removed));
 }
 
 void Blackboard::createEntry(const std::string& key, const TypeInfo& info)
@@ -258,15 +364,24 @@ void Blackboard::cloneInto(Blackboard& dst) const
   // Step 3: insert new entries and remove stale ones under dst.storage_mutex_.
   if(!new_entries.empty() || !keys_to_remove.empty())
   {
-    const std::unique_lock dst_lock(dst.storage_mutex_);
-    for(auto& [key, entry] : new_entries)
+    std::vector<std::shared_ptr<Entry>> removed_entries;
     {
-      dst.storage_.try_emplace(key, std::move(entry));
+      const std::unique_lock dst_lock(dst.storage_mutex_);
+      for(auto& [key, entry] : new_entries)
+      {
+        dst.storage_.try_emplace(key, std::move(entry));
+      }
+      for(const auto& key : keys_to_remove)
+      {
+        auto it = dst.storage_.find(key);
+        if(it != dst.storage_.end())
+        {
+          removed_entries.push_back(std::move(it->second));
+          dst.storage_.erase(it);
+        }
+      }
     }
-    for(const auto& key : keys_to_remove)
-    {
-      dst.storage_.erase(key);
-    }
+    ReleaseEntries(std::move(removed_entries));
   }
 }
 

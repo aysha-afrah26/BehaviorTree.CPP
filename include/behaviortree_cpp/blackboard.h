@@ -76,7 +76,7 @@ public:
     return std::shared_ptr<Blackboard>(new Blackboard(parent));
   }
 
-  virtual ~Blackboard() = default;
+  virtual ~Blackboard();
 
   void enableAutoRemapping(bool remapping);
 
@@ -115,6 +115,11 @@ public:
   template <typename T>
   void set(const std::string& key, const T& value);
 
+  /**
+   * @brief Remove the entry with the given key, if any. This never blocks:
+   * if an AnyPtrLocked to that entry is still alive, the entry is destroyed
+   * only after the lock has been released.
+   */
   void unset(const std::string& key);
 
   [[nodiscard]] const TypeInfo* entryInfo(const std::string& key);
@@ -251,21 +256,6 @@ inline T Blackboard::get(const std::string& key) const
     return result.value();
   }
   throw RuntimeError("Blackboard::get() error. Missing key [", key, "]");
-}
-
-inline void Blackboard::unset(const std::string& key)
-{
-  std::unique_lock storage_lock(storage_mutex_);
-
-  // check local storage
-  auto it = storage_.find(key);
-  if(it == storage_.end())
-  {
-    // No entry, nothing to do.
-    return;
-  }
-
-  storage_.erase(it);
 }
 
 template <typename T>
